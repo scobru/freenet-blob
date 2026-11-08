@@ -87,3 +87,4 @@ export function regenerateShard(
   targetIndex: number,
   fecMetadata: FECMetadata
 ): Uint8Array;
+

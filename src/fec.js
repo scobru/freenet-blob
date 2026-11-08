@@ -321,3 +321,4 @@ export function regenerateShard(receivedShards, targetIndex, fecMetadata) {
 
   return parityShard;
 }
+

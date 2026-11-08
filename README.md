@@ -3,7 +3,8 @@
 > Fault-tolerant, self-healing decentralized blob storage with **Reed-Solomon Forward Error Correction (FEC)** for Freenet.
 
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
-[![Freenet](https://img.shields.io/badge/freenet-v0.4.0-blue.svg)](https://freenet.org)
+[![Freenet Core](https://img.shields.io/badge/freenet%20core-v0.2.155-blue.svg)](https://freenet.org)
+[![freenet-stdlib](https://img.shields.io/badge/@freenetorg%2Ffreenet--stdlib-v0.4.0-blue.svg)](https://npmjs.com/package/@freenetorg/freenet-stdlib)
 [![Zero-WASM-Hassle](https://img.shields.io/badge/fec-GF(2%5E8)-purple.svg)]()
 
 ---
@@ -187,3 +188,4 @@ Runs the full test suite:
 ## 📄 License
 
 MIT © [scobru](https://github.com/scobru)
+
