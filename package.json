@@ -1,0 +1,34 @@
+{
+  "name": "freenet-blob",
+  "version": "1.0.0",
+  "description": "Fault-tolerant decentralized blob storage with Reed-Solomon Erasure Coding (FEC) and auto-healing for Freenet",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": "./src/index.js",
+    "./fec": "./src/fec.js",
+    "./contracts/chunk.wasm": "./contracts/chunk.wasm"
+  },
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "keywords": [
+    "freenet",
+    "blob",
+    "storage",
+    "decentralized",
+    "erasure-coding",
+    "reed-solomon",
+    "fec",
+    "p2p",
+    "resilient",
+    "self-healing"
+  ],
+  "author": "scobru",
+  "license": "MIT",
+  "dependencies": {
+    "@freenetorg/freenet-stdlib": "^0.4.0",
+    "@noble/hashes": "^2.4.0"
+  }
+}
