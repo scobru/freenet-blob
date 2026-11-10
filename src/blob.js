@@ -13,6 +13,8 @@ import {
 } from './crypto.js';
 import { putChunk, getChunk } from './freenet.js';
 
+const DOWNLOAD_CONCURRENCY = 6;
+
 export const DEFAULT_SHARD_SIZE = 256 * 1024; // 256 KB per Freenet chunk contract
 
 /**
@@ -203,7 +205,16 @@ export async function downloadBlob({
 
   const receivedShards = [];
 
-  for (let i = 0; i < totalChunks; i++) {
+  // Random order (parity included) keeps rarely-read parity shards warm on peers; a few fetches
+  // in flight so one dead shard costs one timeout, not a serial stall.
+  const order = Array.from({ length: totalChunks }, (_, i) => i);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  let next = 0;
+
+  const fetchShard = async (i) => {
     const addr = chunks[i];
 
     try {
@@ -232,11 +243,6 @@ export async function downloadBlob({
         status: 'retrieving',
         message: `Retrieved shard ${receivedShards.length}/${targetK} required (${percent}%)`,
       });
-
-      // Break as soon as K shards are reached
-      if (isFec && receivedShards.length >= targetK) {
-        break;
-      }
     } catch (err) {
       onStatusChange({
         status: 'shard_miss',
@@ -244,7 +250,15 @@ export async function downloadBlob({
         shardIndex: i,
       });
     }
-  }
+  };
+
+  const worker = async () => {
+    // Under FEC, K shards suffice: stop launching once reached.
+    while (next < totalChunks && !(isFec && receivedShards.length >= targetK)) {
+      await fetchShard(order[next++]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, totalChunks) }, worker));
 
   if (receivedShards.length < targetK) {
     throw new Error(
