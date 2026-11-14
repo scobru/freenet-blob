@@ -7,6 +7,8 @@
  */
 
 const GF_POLY = 0x11d; // x^8 + x^4 + x^3 + x^2 + 1
+const MAX_TOTAL_SHARDS = 256; // GF(2^8) supports at most 256 distinct evaluation points (0..255)
+const MAX_PARITY_SHARDS = 64;
 const exp = new Uint8Array(512);
 const log = new Uint8Array(256);
 
@@ -110,14 +112,23 @@ export function matrixMul(A, B) {
  * Bottom M rows are Vandermonde parity rows.
  */
 export function createGeneratorMatrix(K, M) {
+  if (K > MAX_TOTAL_SHARDS) {
+    throw new Error('FEC data shard count K cannot exceed GF(2^8) field size (256)');
+  }
+
   const total = K + M;
   const V = Array.from({ length: total }, (_, r) => {
     const alpha = r;
     const row = new Array(K);
     for (let c = 0; c < K; c++) {
-      if (c === 0) row[c] = 1;
-      else if (alpha === 0) row[c] = 0;
-      else row[c] = exp[(log[alpha] * c) % 255];
+      if (alpha === 0 || alpha >= MAX_TOTAL_SHARDS) {
+        // Legacy manifests with K + M > 256 evaluated log[alpha] out-of-bounds, collapsing rows >= 256 to [1, 0, ..., 0]
+        row[c] = c === 0 ? 1 : 0;
+      } else if (c === 0) {
+        row[c] = 1;
+      } else {
+        row[c] = exp[(log[alpha] * c) % 255];
+      }
     }
     return row;
   });
@@ -129,18 +140,20 @@ export function createGeneratorMatrix(K, M) {
 
 /**
  * Calculates optimal parity shard count M for a given data shard count K.
- * Defaults to ~33% redundancy with minimum 1 for K=1 and minimum 2 for K>1.
+ * Defaults to ~33% redundancy with minimum 1 for K=1 and minimum 2 for K>1,
+ * capped so K + M never exceeds GF(2^8) (256 total shards).
  */
 export function calculateParityCount(K, redundancyRatio = 0.33) {
   if (K <= 1) return 1;
-  return Math.min(64, Math.max(2, Math.ceil(K * redundancyRatio)));
+  const desired = Math.min(MAX_PARITY_SHARDS, Math.max(2, Math.ceil(K * redundancyRatio)));
+  return Math.max(0, Math.min(desired, MAX_TOTAL_SHARDS - K));
 }
 
 /**
  * Encodes an input byte buffer into K data shards + M parity shards.
  * @param {Uint8Array} dataBytes
  * @param {Object} [options]
- * @param {number} [options.shardSize=262144] - Shard size in bytes (default 256KB)
+ * @param {number} [options.shardSize=262144] - Target shard size in bytes (default 256KB; scales up above 48MB to stay within 256 total shards)
  * @param {number} [options.parityCount] - Explicit number of parity shards
  * @param {number} [options.redundancyRatio=0.33] - Redundancy ratio if parityCount omitted
  * @returns {{ shards: Array<{ index: number, isParity: boolean, data: Uint8Array }>, k: number, m: number, totalShards: number, originalSize: number, shardSize: number }}
@@ -148,11 +161,17 @@ export function calculateParityCount(K, redundancyRatio = 0.33) {
 export function encodeFEC(dataBytes, options = {}) {
   const originalSize = dataBytes.byteLength;
   const targetShardSize = options.shardSize || 256 * 1024; // 256 KB default
-  const K = Math.max(1, Math.ceil(originalSize / targetShardSize));
+  const rawK = Math.max(1, Math.ceil(originalSize / targetShardSize));
+  const maxK =
+    options.parityCount !== undefined
+      ? Math.max(1, MAX_TOTAL_SHARDS - options.parityCount)
+      : MAX_TOTAL_SHARDS - MAX_PARITY_SHARDS;
+  const K = Math.min(rawK, maxK);
   const shardSize = Math.max(1, Math.ceil(originalSize / K));
-  const M = options.parityCount !== undefined
-    ? options.parityCount
-    : calculateParityCount(K, options.redundancyRatio);
+  const M =
+    options.parityCount !== undefined
+      ? options.parityCount
+      : calculateParityCount(K, options.redundancyRatio);
 
   const dataShards = Array.from({ length: K }, (_, i) => {
     const shard = new Uint8Array(shardSize);
@@ -218,10 +237,33 @@ export function decodeFEC(receivedShards, fecMetadata) {
     );
   }
 
+  const total = K + M;
+  // Prefer canonical shards (< 256) before legacy overflow shards (>= 256), and data shards (< K) before parity shards
+  const sorted = [...receivedShards]
+    .filter((s) => s && Number.isInteger(s.index) && s.index >= 0 && s.index < total && s.data)
+    .sort((a, b) => {
+      const aOverflow = a.index >= MAX_TOTAL_SHARDS ? 1 : 0;
+      const bOverflow = b.index >= MAX_TOTAL_SHARDS ? 1 : 0;
+      if (aOverflow !== bOverflow) return aOverflow - bOverflow;
+      return a.index - b.index;
+    });
+
+  // Legacy manifests with K + M > 256 encoded shards >= 256 with G[0] (duplicates of data shard 0)
+  const uniqueMap = new Map();
+  for (const s of sorted) {
+    const effectiveIndex = s.index >= MAX_TOTAL_SHARDS ? 0 : s.index;
+    if (!uniqueMap.has(effectiveIndex)) {
+      uniqueMap.set(effectiveIndex, { index: effectiveIndex, data: s.data });
+    }
+  }
+  const uniqueShards = Array.from(uniqueMap.values());
+
   // Fast path: if all K original data shards (0 to K-1) are present
   const dataShardMap = new Map();
-  for (const s of receivedShards) {
-    dataShardMap.set(s.index, s.data);
+  for (const s of uniqueShards) {
+    if (s.index < K) {
+      dataShardMap.set(s.index, s.data);
+    }
   }
 
   let hasAllDataShards = true;
@@ -240,8 +282,14 @@ export function decodeFEC(receivedShards, fecMetadata) {
     return fullBuffer.subarray(0, originalSize);
   }
 
+  if (uniqueShards.length < K) {
+    throw new Error(
+      `Insufficient shards to decode FEC: received ${uniqueShards.length}, require at least ${K}`
+    );
+  }
+
   // Slow path: Erasure reconstruction using systematic Reed-Solomon inversion
-  const selected = receivedShards.slice(0, K);
+  const selected = uniqueShards.slice(0, K);
   const G = createGeneratorMatrix(K, M);
 
   const subMatrix = selected.map((s) => G[s.index]);
@@ -250,8 +298,11 @@ export function decodeFEC(receivedShards, fecMetadata) {
     throw new Error('Failed to invert shard submatrix during FEC reconstruction');
   }
 
-  const recoveredDataShards = Array.from({ length: K }, () => new Uint8Array(shardSize));
+  const recoveredDataShards = Array.from({ length: K }, (_, d) =>
+    dataShardMap.has(d) ? dataShardMap.get(d) : new Uint8Array(shardSize)
+  );
   for (let d = 0; d < K; d++) {
+    if (dataShardMap.has(d)) continue;
     const row = invSubMatrix[d];
     const out = recoveredDataShards[d];
     for (let s = 0; s < K; s++) {

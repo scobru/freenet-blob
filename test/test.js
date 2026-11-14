@@ -8,6 +8,7 @@ import {
   makeShardIv,
   getSubtleCrypto,
 } from '../src/index.js';
+import { createGeneratorMatrix, gfMul } from '../src/fec.js';
 
 console.log('🧪 Starting Freenet-Blob Comprehensive Test Suite...\n');
 
@@ -153,6 +154,88 @@ await asyncTest('E2E Blob: Upload, Node Churn Simulation, Resilient Download & A
 
   // Verify store is back to 100% health
   assert.equal(mockFreenetStore.size, fec.totalShards);
+});
+
+await test('FEC: 50MB payload caps K+M at 256 (GF(2^8)) and decodes from shuffled subset', () => {
+  const fiftyMB = 50 * 1024 * 1024;
+  const largeBytes = new Uint8Array(fiftyMB);
+  for (let i = 0; i < fiftyMB; i += 4097) {
+    largeBytes[i] = (i * 13 + 7) & 0xff;
+  }
+
+  const fec = encodeFEC(largeBytes, { shardSize: 256 * 1024 });
+  assert.equal(fec.k, 192);
+  assert.equal(fec.m, 64);
+  assert.equal(fec.totalShards, 256);
+
+  const dropped = new Set([0, 17, 64, 128, 191]);
+  const pool = fec.shards.filter((s) => !dropped.has(s.index));
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  const restored = decodeFEC(pool.slice(0, fec.k), fec);
+
+  assert.equal(restored.byteLength, fiftyMB);
+  for (let i = 0; i < fiftyMB; i += 4097) {
+    assert.equal(restored[i], largeBytes[i]);
+  }
+});
+
+await test('FEC: legacy K=200, M=64 manifest with overflow shards >= 256 decodes cleanly', () => {
+  const K = 200;
+  const M = 64;
+  const shardSize = 64;
+  const originalSize = K * shardSize;
+  const legacyBytes = new Uint8Array(originalSize);
+  for (let i = 0; i < originalSize; i++) {
+    legacyBytes[i] = (i * 29 + 3) & 0xff;
+  }
+
+  const G = createGeneratorMatrix(K, M);
+  const dataShards = Array.from({ length: K }, (_, i) =>
+    legacyBytes.subarray(i * shardSize, (i + 1) * shardSize)
+  );
+  const allShards = dataShards.map((data, index) => ({ index, data }));
+  for (let p = 0; p < M; p++) {
+    const row = G[K + p];
+    const parity = new Uint8Array(shardSize);
+    for (let d = 0; d < K; d++) {
+      const coeff = row[d];
+      if (coeff === 0) continue;
+      for (let b = 0; b < shardSize; b++) {
+        parity[b] ^= gfMul(coeff, dataShards[d][b]);
+      }
+    }
+    allShards.push({ index: K + p, data: parity });
+  }
+
+  // Legacy overflow shards >= 256 duplicate data shard 0
+  assert.deepEqual(allShards[256].data, allShards[0].data);
+
+  const fecMeta = { k: K, m: M, total: K + M, originalSize, shardSize };
+  const receivedWithDuplicates = [
+    allShards[0],
+    allShards[256],
+    allShards[257],
+    allShards[258],
+    allShards[259],
+    allShards[260],
+    ...allShards.slice(1, 199),
+    allShards[200],
+  ];
+
+  const restored = decodeFEC(receivedWithDuplicates, fecMeta);
+  assert.deepEqual(restored, legacyBytes);
+
+  // Also verify recovery when canonical shard 0 is missing and only overflow shard 256 arrived
+  const receivedViaOverflow = [
+    allShards[256],
+    ...allShards.slice(1, 199),
+    allShards[200],
+  ];
+  const restoredOverflow = decodeFEC(receivedViaOverflow, fecMeta);
+  assert.deepEqual(restoredOverflow, legacyBytes);
 });
 
 console.log(`\n🎉 All ${passedTests}/${totalTests} tests passed successfully!`);

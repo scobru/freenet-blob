@@ -204,14 +204,24 @@ export async function downloadBlob({
   });
 
   const receivedShards = [];
+  const independentIndices = new Set();
 
   // Random order (parity included) keeps rarely-read parity shards warm on peers; a few fetches
   // in flight so one dead shard costs one timeout, not a serial stall.
-  const order = Array.from({ length: totalChunks }, (_, i) => i);
-  for (let i = order.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [order[i], order[j]] = [order[j], order[i]];
-  }
+  // Prioritize canonical GF(2^8) indices (< 256) before legacy overflow shards (>= 256), which duplicate shard 0.
+  const shuffle = (arr) => {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  };
+  const primaryCount = Math.min(totalChunks, 256);
+  const primaryOrder = shuffle(Array.from({ length: primaryCount }, (_, i) => i));
+  const overflowOrder = shuffle(
+    Array.from({ length: Math.max(0, totalChunks - primaryCount) }, (_, i) => primaryCount + i)
+  );
+  const order = [...primaryOrder, ...overflowOrder];
   let next = 0;
 
   const fetchShard = async (i) => {
@@ -228,20 +238,23 @@ export async function downloadBlob({
         );
       }
 
-      receivedShards.push({ index: i, data: shardData });
+      const effectiveIndex = isFec && i >= 256 ? 0 : i;
+      receivedShards.push({ index: effectiveIndex, rawIndex: i, data: shardData });
+      independentIndices.add(effectiveIndex);
 
-      const percent = Math.min(100, Math.round((receivedShards.length / targetK) * 100));
+      const retrievedCount = isFec ? independentIndices.size : receivedShards.length;
+      const percent = Math.min(100, Math.round((retrievedCount / targetK) * 100));
       onProgress({
         progress: percent,
-        loaded: Math.min(receivedShards.length * (fec?.shardSize || DEFAULT_SHARD_SIZE), size),
+        loaded: Math.min(retrievedCount * (fec?.shardSize || DEFAULT_SHARD_SIZE), size),
         total: size,
-        retrievedCount: receivedShards.length,
+        retrievedCount,
         requiredCount: targetK,
       });
 
       onStatusChange({
         status: 'retrieving',
-        message: `Retrieved shard ${receivedShards.length}/${targetK} required (${percent}%)`,
+        message: `Retrieved shard ${retrievedCount}/${targetK} required (${percent}%)`,
       });
     } catch (err) {
       onStatusChange({
@@ -253,16 +266,17 @@ export async function downloadBlob({
   };
 
   const worker = async () => {
-    // Under FEC, K shards suffice: stop launching once reached.
-    while (next < totalChunks && !(isFec && receivedShards.length >= targetK)) {
+    // Under FEC, K independent shards suffice: stop launching once reached.
+    while (next < totalChunks && !(isFec && independentIndices.size >= targetK)) {
       await fetchShard(order[next++]);
     }
   };
   await Promise.all(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, totalChunks) }, worker));
 
-  if (receivedShards.length < targetK) {
+  const retrievedCount = isFec ? independentIndices.size : receivedShards.length;
+  if (retrievedCount < targetK) {
     throw new Error(
-      `Failed to reconstruct blob: only ${receivedShards.length}/${targetK} shards available on Freenet`
+      `Failed to reconstruct blob: only ${retrievedCount}/${targetK} shards available on Freenet`
     );
   }
 
@@ -413,9 +427,22 @@ export async function repairBlob({
     message: `Regenerating and restoring ${missingIndices.length} missing shards...`,
   });
 
+  // Decode once from independent shards so legacy manifests (> 256 shards) recover without matrix singularity
+  const restoredBytes = decodeFEC(availableShards, fec);
+  const restoredDataShards = Array.from({ length: fec.k }, (_, i) => {
+    const shard = new Uint8Array(fec.shardSize);
+    const start = i * fec.shardSize;
+    if (start < restoredBytes.byteLength) {
+      shard.set(
+        restoredBytes.subarray(start, Math.min(start + fec.shardSize, restoredBytes.byteLength))
+      );
+    }
+    return shard;
+  }).map((data, index) => ({ index, data }));
+
   let healedCount = 0;
   for (const missingIndex of missingIndices) {
-    const healedPlain = regenerateShard(availableShards, missingIndex, fec);
+    const healedPlain = regenerateShard(restoredDataShards, missingIndex, fec);
     let payload = healedPlain;
 
     if (encrypted) {
