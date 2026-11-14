@@ -21,6 +21,8 @@ $$\text{Probability of success} = (\text{single chunk reliability})^N$$
 - $M$ parity shards are generated using an ultra-fast Galois Field $\text{GF}(2^8)$ matrix engine (~33% redundancy).
 - **Any $K$ shards out of $(K + M)$ are mathematically sufficient to reconstruct the entire file bit-for-bit.**
 - **Self-Healing**: If nodes drop shards, any client or node can detect missing shards and use `repairBlob()` to regenerate and re-publish them in the background!
+- **GF(2^8) 256-Shard Bound & Auto-Scaling**: Because $\text{GF}(2^8)$ supports at most 256 distinct evaluation points (`0..255`), total shards are capped at $K + M \le 256$ (up to $M = 64$ parity shards). Above ~48 MB (with 256 KB default shards), `encodeFEC()` automatically scales `shardSize` up so $K \le 192$ and $K + M \le 256$.
+- **Parallel Random-Order Fetch & Legacy Compatibility**: `downloadBlob()` fetches shards in shuffled order with 6 concurrent workers (`DOWNLOAD_CONCURRENCY = 6`) to keep parity shards warm while prioritizing canonical indices `0..255`. For older manifests with $K + M > 256$ (where overflow indices $\ge 256$ duplicated shard `0`), `downloadBlob()`, `decodeFEC()`, and `repairBlob()` deduplicate overflow indices back to shard `0` to prevent singular submatrix failures.
 
 ```
                                   +---------------+
@@ -75,8 +77,8 @@ const manifest = await uploadBlob({
   filename: 'track.flac',
   mimeType: 'audio/flac',
   encrypt: false, // Set true for private end-to-end encrypted storage
-  shardSize: 256 * 1024, // 256 KB per Freenet contract
-  parityRatio: 0.33,     // ~33% redundancy (M parity shards)
+  shardSize: 256 * 1024, // Target 256 KB per shard (auto-scales above ~48 MB so K + M <= 256)
+  parityRatio: 0.33,     // ~33% redundancy (M parity shards, capped so K + M <= 256)
   onProgress: ({ progress, shardIndex, totalShards }) => {
     console.log(`Uploading: ${shardIndex}/${totalShards} (${progress}%)`);
   },
@@ -182,6 +184,8 @@ Runs the full test suite:
 - Multi-chunk fault recovery with arbitrary lost shards
 - High-throughput byte reconstruction
 - Chunk regeneration & self-healing
+- Large-file $\text{GF}(2^8)$ cap (50 MB capped at $K=192, M=64$, $K + M = 256$)
+- Legacy manifest compatibility ($K=200, M=64$ with overflow shards $\ge 256$)
 
 ---
 
